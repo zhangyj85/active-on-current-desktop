@@ -2,7 +2,7 @@
 // @id active-on-current-desktop
 // @name active-on-current-desktop
 // @description Activate application windows on the current virtual desktop.
-// @version 1.0.2
+// @version 1.1.1
 // @author DeskPilot contributors; meteoni (activation layer)
 // @include explorer.exe
 // @include SearchHost.exe
@@ -24,23 +24,21 @@ Installation / 安装：
 安装 Windhawk 后创建本地 mod，粘贴本文件全部内容并保存编译即可。
 第三方启动器请在高级设置的自定义包含进程中添加，无需修改代码。
 首次缺少符号时，Windhawk 可能需要下载微软符号文件。
-本机功能已由用户验证；其他 Windows 版本仍取决于私有接口和符号兼容性。
+其他 Windows 版本仍取决于私有接口和符号兼容性。
+
+在 mod 的“设置”中添加目标应用的 EXE 名称或完整路径，再选择打开方式：
+- 保留所在桌面并跳转：优先激活已有窗口，允许跳转到其所在桌面，不搬移窗口。
+- 不接管，使用原始启动行为：保留应用的多实例、参数和窗口激活行为。
+未配置的应用继续搬到当前桌面；重复匹配时“不接管”优先。
+留空的应用项会忽略；保存设置后由 Windhawk 重新加载，不增加后台轮询。
+“保留所在桌面”不绑定桌面编号；没有已有窗口时继续原始启动流程。
+同一 EXE 多窗口时仍使用统一窗口选择规则，不识别账号或文档语义。
+目标应用规则与高级设置中的“启动器注入进程”是两种不同配置。
 本源码不需要配套 DLL、额外常驻程序、账号或联网学习服务。
 
-Add launcher executable names/paths through this mod's Advanced custom process
-inclusion list. Every selected ordinary launcher uses the same launch hooks.
-If the Windhawk engine excludes all processes, its inclusion list must allow the
-same launchers. Disable earlier summon/desktop-stealing mods to avoid conflicts.
-
-Ordinary argument-free EXE/shortcut opens reuse an existing principal window.
-Cold starts, files/URLs, arguments, explicit elevation verbs, special shortcut
-flags, and unsupported launch flags pass through to the original launch. No helper process, application profiles or learning.
-
-Windows Search uses an in-mod foreground-permission channel. Explorer also
-intercepts activation-driven desktop switches, preserving deliberate navigation.
-Private Shell interfaces/symbols are version-dependent. Compatibility requires
-the corresponding interfaces and symbols. No mod-owned logging, telemetry,
-application profiles, or persistent user data.
+普通无参数 EXE/快捷方式打开可复用已有主窗口；带参数、特殊动词或特殊快捷方式
+仍执行原始启动。依赖对应版本的私有 Shell 接口和符号，未提供跨版本保证。
+没有日志、测试入口、行为学习、额外常驻程序或后台定时扫描。
 
 Activation logic adapted from Don't Pull Me to Another Desktop 0.4.1 by meteoni:
 https://github.com/ramensoftware/windhawk-mods/blob/main/mods/prevent-virtual-desktop-stealing.wh.cpp
@@ -72,6 +70,25 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
+
+// ==WindhawkModSettings==
+/*
+- applications:
+  - - executable: ""
+      $name: 应用程序 EXE 名称或完整路径
+      $description: 输入进程名（包含 .exe）或完整路径；不区分大小写，留空则忽略。
+    - behavior: keepDesktop
+      $name: 打开方式
+      $options:
+      - keepDesktop: 保留所在桌面并跳转
+      - original: 不接管，使用原始启动行为
+  $name: 应用程序规则
+  $description: >-
+    点击添加按钮配置应用；未列出的应用继续在当前桌面激活。
+    保留所在桌面会复用已有窗口，不绑定桌面编号；不接管适合保留多实例行为。
+    同一应用重复匹配时“不接管”优先。
+*/
+// ==/WindhawkModSettings==
 
 #include <algorithm>
 #include <atomic>
@@ -122,6 +139,128 @@ struct ComApartment {
     return SUCCEEDED(result) || result == RPC_E_CHANGED_MODE;
   }
 };
+
+class Handle {
+  HANDLE value = nullptr;
+
+public:
+  explicit Handle(HANDLE handle = nullptr) : value(handle) {}
+  Handle(const Handle &) = delete;
+  Handle &operator=(const Handle &) = delete;
+  ~Handle() {
+    if (value)
+      CloseHandle(value);
+  }
+  HANDLE get() const { return value; }
+  explicit operator bool() const { return value != nullptr; }
+};
+namespace Process {
+struct ProcessIdentity {
+  std::wstring path;
+  ULONGLONG created = 0;
+};
+static ProcessIdentity ReadProcess(DWORD pid,
+                                   const std::wstring *requiredPath = nullptr) {
+  Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+  if (!process)
+    return {};
+  wchar_t small[MAX_PATH];
+  DWORD length = ARRAYSIZE(small);
+  std::wstring extended;
+  const wchar_t *path = small;
+  if (!QueryFullProcessImageNameW(process.get(), 0, small, &length)) {
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+      return {};
+    extended.resize(32768);
+    length = (DWORD)extended.size();
+    if (!QueryFullProcessImageNameW(process.get(), 0, extended.data(), &length))
+      return {};
+    path = extended.data();
+  }
+  if (requiredPath && (requiredPath->size() != length ||
+                       _wcsnicmp(path, requiredPath->c_str(), length)))
+    return {};
+  // Trust checks only need a path. Creation time identifies window candidates.
+  if (!requiredPath)
+    return {std::wstring(path, length), 0};
+  FILETIME created, exit, kernel, user;
+  if (!GetProcessTimes(process.get(), &created, &exit, &kernel, &user))
+    return {};
+  return {{}, (ULONGLONG(created.dwHighDateTime) << 32) | created.dwLowDateTime};
+}
+} // namespace Process
+
+namespace Policy {
+enum class Mode { Summon, KeepDesktop, Original };
+static std::vector<std::wstring> keepDesktop, original;
+
+static std::wstring Normalize(std::wstring_view value) {
+  const auto first = value.find_first_not_of(L" \t\r\n");
+  if (first == std::wstring_view::npos)
+    return {};
+  value = value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+  if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+    value = value.substr(1, value.size() - 2);
+  std::wstring result(value);
+  std::replace(result.begin(), result.end(), L'/', L'\\');
+  return result;
+}
+
+static void Load() {
+  // Settings are immutable while hooks run. Windhawk reloads the mod on edits.
+  keepDesktop.clear();
+  original.clear();
+  for (int i = 0;; ++i) {
+    auto mode = WindhawkUtils::StringSetting::make(L"applications[%d].behavior", i);
+    if (!*mode.get())
+      break;
+    auto executable = WindhawkUtils::StringSetting::make(L"applications[%d].executable", i);
+    auto entry = Normalize(executable.get());
+    if (entry.empty())
+      continue;
+    if (!wcscmp(mode.get(), L"original"))
+      original.push_back(std::move(entry));
+    else if (!wcscmp(mode.get(), L"keepDesktop"))
+      keepDesktop.push_back(std::move(entry));
+  }
+}
+
+static bool Matches(const std::vector<std::wstring> &rules,
+                    std::wstring_view path, std::wstring_view name) {
+  for (const auto &rule : rules) {
+    const auto target = rule.find_first_of(L"\\:") == std::wstring::npos ? name : path;
+    if (rule.size() == target.size() &&
+        CompareStringOrdinal(rule.data(), static_cast<int>(rule.size()),
+                             target.data(), static_cast<int>(target.size()), TRUE) == CSTR_EQUAL)
+      return true;
+  }
+  return false;
+}
+
+static Mode ForPath(std::wstring_view path) {
+  if (keepDesktop.empty() && original.empty())
+    return Mode::Summon;
+  const auto slash = path.find_last_of(L"\\/");
+  const auto name = path.substr(slash == std::wstring_view::npos ? 0 : slash + 1);
+  if (Matches(original, path, name))
+    return Mode::Original;
+  return Matches(keepDesktop, path, name) ? Mode::KeepDesktop : Mode::Summon;
+}
+
+static Mode ForWindow(HWND window) noexcept {
+  if (keepDesktop.empty() && original.empty())
+    return Mode::Summon;
+  try {
+    DWORD pid = 0;
+    if (!GetWindowThreadProcessId(window, &pid))
+      return Mode::Original;
+    const auto image = Process::ReadProcess(pid);
+    return image.path.empty() ? Mode::Original : ForPath(image.path);
+  } catch (...) {
+    return Mode::Original;
+  }
+}
+} // namespace Policy
 
 namespace Activation {
 // Track activation-caused switches separately from deliberate desktop
@@ -254,8 +393,7 @@ static void PublishStartup(bool unsupported, HANDLE readyEvent) {
 }
 
 static bool RuntimeCancellationRequested() {
-  return g_runtimeCancelEvent &&
-         WaitForSingleObject(g_runtimeCancelEvent, 0) == WAIT_OBJECT_0;
+  return g_unloading.load(std::memory_order_acquire);
 }
 
 static bool GuidEqual(const GUID &a, const GUID &b) {
@@ -281,10 +419,6 @@ static void ClearCurrentDesktopId() {
 }
 
 static bool LoadCurrentDesktopId(GUID *id) {
-  if (!id) {
-    return false;
-  }
-
   AcquireSRWLockShared(&g_currentDesktopLock);
   bool valid = g_currentDesktopValid;
   if (valid) {
@@ -406,22 +540,17 @@ static void RecordNavigationSelectedFocus(uint64_t generation,
   ReleaseSRWLockExclusive(&g_navigationFocusLock);
 }
 
-static bool
-ConsumeNavigationSelectedFocus(IApplicationView *view, HWND hwnd,
-                               NavigationFocusRecord *matchedRecord) {
-  if (matchedRecord) {
-    *matchedRecord = {};
-  }
-
+static NavigationFocusRecord
+ConsumeNavigationSelectedFocus(IApplicationView *view, HWND hwnd) {
   if (!view || !hwnd) {
-    return false;
+    return {};
   }
 
   DWORD pid = 0;
   DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
 
   if (!pid || !tid) {
-    return false;
+    return {};
   }
 
   size_t matchedIndex = kNavigationFocusHistoryCapacity;
@@ -486,15 +615,7 @@ ConsumeNavigationSelectedFocus(IApplicationView *view, HWND hwnd,
 
   ReleaseSRWLockExclusive(&g_navigationFocusLock);
 
-  if (!matched.valid) {
-    return false;
-  }
-
-  if (matchedRecord) {
-    *matchedRecord = matched;
-  }
-
-  return true;
+  return matched;
 }
 
 static void InvalidateNavigationState() {
@@ -652,9 +773,8 @@ ForegroundViewChanged_Hook(void *pThis, IVirtualDesktopManagerPrivate *manager,
 
   g_foregroundPolicyHwnd = GetForegroundPolicyViewHwnd(view);
 
-  g_foregroundPolicyNavigationFocus = {};
-  ConsumeNavigationSelectedFocus(view, g_foregroundPolicyHwnd,
-                                 &g_foregroundPolicyNavigationFocus);
+  g_foregroundPolicyNavigationFocus =
+      ConsumeNavigationSelectedFocus(view, g_foregroundPolicyHwnd);
 
   HRESULT hr = g_foregroundViewChangedOriginal(pThis, manager, animator, view);
 
@@ -794,9 +914,7 @@ static DWORD WINAPI NotificationThreadProc(void *) {
   }
 
   ComApartment apartment;
-  const HRESULT coHr = apartment.result;
-
-  if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
+  if (!apartment) {
     PublishStartup(false, g_notificationReadyEvent);
     return 0;
   }
@@ -807,61 +925,59 @@ static DWORD WINAPI NotificationThreadProc(void *) {
     return 0;
   }
 
-  IServiceProvider *serviceProvider = nullptr;
-  IVirtualDesktopManagerInternal *managerInternal = nullptr;
-  IVirtualDesktopNotificationService *notificationService = nullptr;
-  VirtualDesktopNotificationListener *listener = nullptr;
+  ComPtr<IServiceProvider> serviceProvider;
+  ComPtr<IVirtualDesktopManagerInternal> managerInternal;
+  ComPtr<IVirtualDesktopNotificationService> notificationService;
+  ComPtr<VirtualDesktopNotificationListener> listener;
   DWORD cookie = 0;
   bool unsupported = false;
 
   HRESULT hr = CoCreateInstance(kClsidImmersiveShell, nullptr,
                                 CLSCTX_LOCAL_SERVER, __uuidof(IServiceProvider),
-                                reinterpret_cast<void **>(&serviceProvider));
+                                reinterpret_cast<void **>(&serviceProvider.p));
 
-  if (SUCCEEDED(hr) && serviceProvider) {
+  if (SUCCEEDED(hr) && serviceProvider.p) {
     hr = serviceProvider->QueryService(
         kClsidVirtualDesktopManagerInternal,
         kIidVirtualDesktopManagerInternal24H2,
-        reinterpret_cast<void **>(&managerInternal));
+        reinterpret_cast<void **>(&managerInternal.p));
 
-    if (SUCCEEDED(hr) && !managerInternal) {
+    if (SUCCEEDED(hr) && !managerInternal.p) {
       hr = E_NOINTERFACE;
     }
 
     unsupported = hr == E_NOINTERFACE;
   }
 
-  if (SUCCEEDED(hr) && serviceProvider) {
+  if (SUCCEEDED(hr) && serviceProvider.p) {
     hr = serviceProvider->QueryService(
         kServiceVirtualDesktopNotification,
         kIidVirtualDesktopNotificationService,
-        reinterpret_cast<void **>(&notificationService));
+        reinterpret_cast<void **>(&notificationService.p));
 
-    if (SUCCEEDED(hr) && !notificationService) {
+    if (SUCCEEDED(hr) && !notificationService.p) {
       hr = E_NOINTERFACE;
     }
 
     unsupported = unsupported || hr == E_NOINTERFACE;
   }
 
-  if (SUCCEEDED(hr) && notificationService) {
-    listener = new VirtualDesktopNotificationListener();
+  if (SUCCEEDED(hr) && notificationService.p) {
+    listener.p = new VirtualDesktopNotificationListener();
 
-    hr = notificationService->Register(listener, &cookie);
+    hr = notificationService->Register(listener.p, &cookie);
   }
 
-  if (SUCCEEDED(hr) && managerInternal) {
-    IVirtualDesktop *currentDesktop = nullptr;
+  if (SUCCEEDED(hr) && managerInternal.p) {
+    ComPtr<IVirtualDesktop> currentDesktop;
 
-    HRESULT currentHr = managerInternal->GetCurrentDesktop(&currentDesktop);
+    HRESULT currentHr = managerInternal->GetCurrentDesktop(&currentDesktop.p);
 
-    if (SUCCEEDED(currentHr) && currentDesktop) {
+    if (SUCCEEDED(currentHr) && currentDesktop.p) {
       GUID id = {};
       if (SUCCEEDED(currentDesktop->GetId(&id))) {
         StoreCurrentDesktopId(id);
       }
-
-      currentDesktop->Release();
     }
   }
 
@@ -889,24 +1005,8 @@ static DWORD WINAPI NotificationThreadProc(void *) {
   g_notificationReady.store(false, std::memory_order_release);
   ClearCurrentDesktopId();
 
-  if (notificationService && cookie) {
+  if (notificationService.p && cookie) {
     notificationService->Unregister(cookie);
-  }
-
-  if (listener) {
-    listener->Release();
-  }
-
-  if (notificationService) {
-    notificationService->Release();
-  }
-
-  if (managerInternal) {
-    managerInternal->Release();
-  }
-
-  if (serviceProvider) {
-    serviceProvider->Release();
   }
 
   return 0;
@@ -943,15 +1043,8 @@ static bool StartNotificationCache() {
   DWORD waitResult =
       WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, 5000);
 
-  if (waitResult == WAIT_OBJECT_0) {
-    return false;
-  }
-
-  if (waitResult == WAIT_OBJECT_0 + 1) {
-    return g_notificationReady.load(std::memory_order_acquire);
-  }
-
-  return false;
+  return waitResult == WAIT_OBJECT_0 + 1 &&
+         g_notificationReady.load(std::memory_order_acquire);
 }
 
 static void StopNotificationCache() {
@@ -1230,6 +1323,10 @@ static HRESULT SwitchDesktopInternal_Hook(void *pThis,
     return g_switchDesktopInternalOriginal(pThis, requestedDesktop);
   }
 
+  // Both opt-out modes must bypass Explorer's activation-rescue layer too.
+  if (Policy::ForWindow(g_foregroundPolicyHwnd) != Policy::Mode::Summon)
+    return g_switchDesktopInternalOriginal(pThis, requestedDesktop);
+
   GUID requestedId = {};
   HRESULT requestedIdHr = requestedDesktop->GetId(&requestedId);
 
@@ -1345,8 +1442,6 @@ enum class RuntimeState {
 
 static std::atomic<RuntimeState> g_runtimeState{RuntimeState::Stopped};
 
-static std::atomic<bool> g_virtualDesktopHooksInstalled{false};
-
 static SRWLOCK g_runtimeInitLock = SRWLOCK_INIT;
 
 static HANDLE g_runtimeInitThread = nullptr;
@@ -1359,10 +1454,6 @@ static bool IsCurrentProcessWindow(HWND window) {
 }
 
 static bool InstallVirtualDesktopHooks() {
-  if (g_virtualDesktopHooksInstalled.load(std::memory_order_acquire)) {
-    return true;
-  }
-
   if (RuntimeCancellationRequested()) {
     return false;
   }
@@ -1434,84 +1525,38 @@ static bool InstallVirtualDesktopHooks() {
     return false;
   }
 
-  g_virtualDesktopHooksInstalled.store(true, std::memory_order_release);
-
   return !RuntimeCancellationRequested();
 }
 
-static bool WaitForShellHostRetryDelay() {
-  DWORD waitResult = WaitForSingleObject(g_runtimeCancelEvent, 500);
-
-  if (waitResult == WAIT_TIMEOUT) {
-    return !g_unloading.load(std::memory_order_acquire);
-  }
-
-  return false;
-}
-
 static DWORD WINAPI ShellHostInitThreadProc(void *) {
-  if (g_unloading.load(std::memory_order_acquire) ||
-      RuntimeCancellationRequested()) {
-    g_runtimeState.store(RuntimeState::Stopped, std::memory_order_release);
-    return 0;
-  }
-
   constexpr int kMaxRuntimeStartAttempts = 30;
-
-  for (int attempt = 1; attempt <= kMaxRuntimeStartAttempts; ++attempt) {
-    bool hookInstallFailed = false;
+  for (int attempt = 1;
+       attempt <= kMaxRuntimeStartAttempts && !RuntimeCancellationRequested();
+       ++attempt) {
     bool started = StartWorker();
-
-    if (started && !RuntimeCancellationRequested()) {
+    if (started && !RuntimeCancellationRequested())
       started = StartNotificationCache();
-    }
-
+    bool hookInstallFailed = false;
     if (started && !RuntimeCancellationRequested()) {
       if (InstallVirtualDesktopHooks() && !RuntimeCancellationRequested()) {
         g_runtimeState.store(RuntimeState::Ready, std::memory_order_release);
-
         return 0;
       }
-
-      if (!RuntimeCancellationRequested()) {
-        hookInstallFailed = true;
-      }
+      hookInstallFailed = !RuntimeCancellationRequested();
     }
-
     StopNotificationCache();
     StopWorker();
-
-    if (hookInstallFailed) {
-      g_runtimeState.store(RuntimeState::Stopped, std::memory_order_release);
-
+    if (hookInstallFailed || RuntimeCancellationRequested())
+      break;
+    if (g_startUnsupported.load(std::memory_order_acquire)) {
+      g_runtimeState.store(RuntimeState::Unsupported, std::memory_order_release);
       return 0;
     }
-
-    const bool unsupported = g_startUnsupported.load(std::memory_order_acquire);
-
-    if (g_unloading.load(std::memory_order_acquire) ||
-        RuntimeCancellationRequested()) {
-      g_runtimeState.store(RuntimeState::Stopped, std::memory_order_release);
-      return 0;
-    }
-
-    if (unsupported) {
-      g_runtimeState.store(RuntimeState::Unsupported,
-                           std::memory_order_release);
-
-      return 0;
-    }
-
-    if (attempt < kMaxRuntimeStartAttempts) {
-      if (!WaitForShellHostRetryDelay()) {
-        g_runtimeState.store(RuntimeState::Stopped, std::memory_order_release);
-        return 0;
-      }
-    }
+    if (attempt < kMaxRuntimeStartAttempts &&
+        WaitForSingleObject(g_runtimeCancelEvent, 500) != WAIT_TIMEOUT)
+      break;
   }
-
   g_runtimeState.store(RuntimeState::Stopped, std::memory_order_release);
-
   return 0;
 }
 
@@ -1595,13 +1640,6 @@ static HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName,
     return hwnd;
   }
 
-  DWORD ownerPid = 0;
-  GetWindowThreadProcessId(hwnd, &ownerPid);
-
-  if (ownerPid != GetCurrentProcessId()) {
-    return hwnd;
-  }
-
   PromoteCurrentProcessToShellHost();
 
   return hwnd;
@@ -1609,8 +1647,6 @@ static HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName,
 
 static void StopRuntimeBeforeUninit() {
   g_unloading.store(true, std::memory_order_release);
-
-  g_virtualDesktopHooksInstalled.store(false, std::memory_order_release);
 
   if (g_runtimeCancelEvent) {
     SetEvent(g_runtimeCancelEvent);
@@ -1639,8 +1675,6 @@ static void StopRuntimeBeforeUninit() {
 
 BOOL Init() {
   g_unloading.store(false, std::memory_order_release);
-
-  g_virtualDesktopHooksInstalled.store(false, std::memory_order_release);
 
   g_runtimeCancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -1683,20 +1717,6 @@ static decltype(&ShellExecuteW) originalSimple;
 using LinkInvoke = HRESULT(WINAPI *)(IContextMenu *, LPCMINVOKECOMMANDINFO);
 static LinkInvoke originalLink;
 
-class Handle {
-  HANDLE value = nullptr;
-
-public:
-  explicit Handle(HANDLE handle = nullptr) : value(handle) {}
-  Handle(const Handle &) = delete;
-  Handle &operator=(const Handle &) = delete;
-  ~Handle() {
-    if (value)
-      CloseHandle(value);
-  }
-  HANDLE get() const { return value; }
-  explicit operator bool() const { return value != nullptr; }
-};
 template <class T> using Ptr = ComPtr<T>;
 using Apartment = ComApartment;
 // The private interface declarations intentionally preserve their ABI slots.
@@ -1750,57 +1770,24 @@ static bool Empty(PCWSTR text) {
       return false;
   return true;
 }
-struct ProcessIdentity {
-  std::wstring path;
-  ULONGLONG created = 0;
-};
-static ProcessIdentity ReadProcess(DWORD pid,
-                                   const std::wstring *requiredPath = nullptr) {
-  Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-  if (!process)
-    return {};
-  wchar_t small[MAX_PATH];
-  DWORD length = ARRAYSIZE(small);
-  std::wstring extended;
-  const wchar_t *path = small;
-  if (!QueryFullProcessImageNameW(process.get(), 0, small, &length)) {
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-      return {};
-    extended.resize(32768);
-    length = (DWORD)extended.size();
-    if (!QueryFullProcessImageNameW(process.get(), 0, extended.data(), &length))
-      return {};
-    path = extended.data();
-  }
-  if (requiredPath && (requiredPath->size() != length ||
-                       _wcsnicmp(path, requiredPath->c_str(), length)))
-    return {};
-  // Trust checks only need a path. Creation time identifies window candidates.
-  if (!requiredPath)
-    return {std::wstring(path, length), 0};
-  FILETIME created, exit, kernel, user;
-  if (!GetProcessTimes(process.get(), &created, &exit, &kernel, &user))
-    return {};
-  return {{}, (ULONGLONG(created.dwHighDateTime) << 32) | created.dwLowDateTime};
-}
-static bool SearchProcess(DWORD pid) {
+using Process::ReadProcess;
+enum class Host { Launcher, Shell, Search };
+static Host IdentifyHost(DWORD pid) {
   const auto process = ReadProcess(pid);
   wchar_t windows[MAX_PATH];
   if (!GetWindowsDirectoryW(windows, ARRAYSIZE(windows)))
-    return false;
+    return Host::Launcher;
+  if (!_wcsicmp(process.path.c_str(),
+                (std::wstring(windows) + L"\\explorer.exe").c_str()))
+    return Host::Shell;
   const std::wstring prefix = std::wstring(windows) + L"\\SystemApps\\";
   if (process.path.size() <= prefix.size() ||
       _wcsnicmp(process.path.c_str(), prefix.c_str(), prefix.size()))
-    return false;
+    return Host::Launcher;
   const wchar_t *name = wcsrchr(process.path.c_str(), L'\\');
   return name && (!_wcsicmp(name + 1, L"SearchHost.exe") ||
-                  !_wcsicmp(name + 1, L"StartMenuExperienceHost.exe"));
-}
-static bool IsExplorer() {
-  wchar_t windows[MAX_PATH];
-  return GetWindowsDirectoryW(windows, ARRAYSIZE(windows)) &&
-         !_wcsicmp(ReadProcess(GetCurrentProcessId()).path.c_str(),
-                   (std::wstring(windows) + L"\\explorer.exe").c_str());
+                  !_wcsicmp(name + 1, L"StartMenuExperienceHost.exe"))
+             ? Host::Search : Host::Launcher;
 }
 static bool ReadLinkTarget(IShellLinkW *link, std::wstring &path) {
   // Only emptiness is needed: do not copy the shortcut's command line.
@@ -2039,7 +2026,7 @@ static Candidate SelectCandidate(const std::vector<Candidate> &candidates,
 struct WindowSearch {
   const std::wstring &target;
   std::vector<Candidate> candidates;
-  std::unordered_map<DWORD, ProcessIdentity> identities;
+  std::unordered_map<DWORD, ULONGLONG> identities;
 };
 static BOOL CALLBACK CollectWindow(HWND window, LPARAM parameter) {
   auto &search = *(WindowSearch *)parameter;
@@ -2057,8 +2044,8 @@ static BOOL CALLBACK CollectWindow(HWND window, LPARAM parameter) {
   auto found = search.identities.find(pid);
   if (found == search.identities.end())
     found =
-        search.identities.emplace(pid, ReadProcess(pid, &search.target)).first;
-  if (!found->second.created)
+        search.identities.emplace(pid, ReadProcess(pid, &search.target).created).first;
+  if (!found->second)
     return TRUE;
   DWORD cloak = 0;
   if (FAILED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloak,
@@ -2076,7 +2063,7 @@ static BOOL CALLBACK CollectWindow(HWND window, LPARAM parameter) {
   if (width < 80 || height < 60)
     return TRUE;
   search.candidates.push_back(
-      {window, pid, found->second.created, width * height});
+      {window, pid, found->second, width * height});
   return TRUE;
 }
 static bool InputUnchanged(DWORD stamp) {
@@ -2092,7 +2079,13 @@ static bool ActivateExisting(PCWSTR file, PCWSTR verb, PCWSTR arguments,
       Pid(GetForegroundWindow()); // Preserve identity even if the popup is
                                   // destroyed.
   if (!sourcePid ||
-      (sourcePid != GetCurrentProcessId() && !SearchProcess(sourcePid)))
+      (sourcePid != GetCurrentProcessId() && IdentifyHost(sourcePid) != Host::Search))
+    return false;
+  std::wstring targetPath;
+  if (!ResolveTarget(file, targetPath))
+    return false;
+  const auto mode = Policy::ForPath(targetPath);
+  if (mode == Policy::Mode::Original)
     return false;
   const int primaryButton = GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON;
   const DWORD started = GetTickCount();
@@ -2105,9 +2098,6 @@ static bool ActivateExisting(PCWSTR file, PCWSTR verb, PCWSTR arguments,
   }
   LASTINPUTINFO input{sizeof(input)};
   if (!GetLastInputInfo(&input) || GetTickCount() - input.dwTime > 2000)
-    return false;
-  std::wstring targetPath;
-  if (!ResolveTarget(file, targetPath))
     return false;
   WindowSearch search{targetPath, {}, {}};
   EnumWindows(CollectWindow, (LPARAM)&search);
@@ -2146,7 +2136,7 @@ static bool ActivateExisting(PCWSTR file, PCWSTR verb, PCWSTR arguments,
   if (FAILED(services.publicManager->IsWindowOnCurrentVirtualDesktop(
           target.window, &current)))
     return false;
-  if (!current) {
+  if (!current && mode == Policy::Mode::Summon) {
     if (!services.GetView(target.window, view))
       return false;
     BOOL canMove = FALSE;
@@ -2165,7 +2155,7 @@ static bool ActivateExisting(PCWSTR file, PCWSTR verb, PCWSTR arguments,
       !commitDesktop.p || FAILED(commitDesktop->GetId(&currentId)) ||
       !IsEqualGUID(currentId, origin))
     return false;
-  if (!current &&
+  if (!current && mode == Policy::Mode::Summon &&
       FAILED(services.manager->MoveViewToDesktop(view.p, commitDesktop.p)))
     return false;
   committed =
@@ -2287,8 +2277,8 @@ static DWORD WINAPI InstallLinkHook(void *) {
   }
   return 0;
 }
-static bool Init() {
-  if (SearchProcess(GetCurrentProcessId()))
+static bool Init(Host host) {
+  if (host == Host::Search)
     return StartGrant();
   HMODULE shell = GetModuleHandleW(L"shell32.dll");
   if (!shell)
@@ -2337,12 +2327,18 @@ static void Uninit() {
 
 static bool activationStarted = false;
 BOOL Wh_ModInit() {
-  if (Active::IsExplorer()) {
+  try {
+    Policy::Load();
+  } catch (...) {
+    return FALSE;
+  }
+  const auto host = Active::IdentifyHost(GetCurrentProcessId());
+  if (host == Active::Host::Shell) {
     if (!Activation::Init())
       return FALSE;
     activationStarted = true;
   }
-  if (Active::Init())
+  if (Active::Init(host))
     return TRUE;
   if (activationStarted) {
     Activation::BeforeUninit();
@@ -2364,4 +2360,9 @@ void Wh_ModUninit() {
   Active::Uninit();
   if (activationStarted)
     Activation::Uninit();
+}
+
+BOOL Wh_ModSettingsChanged(BOOL *reload) {
+  *reload = TRUE;
+  return TRUE;
 }
